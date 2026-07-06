@@ -67,12 +67,17 @@ function broadcastToEvent(eventCode, payload) {
   return count;
 }
 
-function createPatternCommand(pattern) {
-  const startAt = Date.now() + 900; // tüm cihazlar için ortak başlangıç
+function createPatternCommand(pattern, calibration = {}) {
+  const startAt = Date.now() + 1200; // tüm cihazlar için ortak başlangıç
   return {
     type: "pattern",
     id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
     startAt,
+    calibration: {
+      ios: Number(calibration.ios || 0),
+      android: Number(calibration.android || 0),
+      default: Number(calibration.default || 0)
+    },
     pattern
   };
 }
@@ -147,8 +152,13 @@ wss.on("connection", (ws) => {
         command = {
           type: "flash_test",
           id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
-          startAt: Date.now() + 500,
-          duration: Number(msg.duration || 350)
+          startAt: Date.now() + 900,
+          duration: Number(msg.duration || 350),
+          calibration: {
+            ios: Number(msg.calibration?.ios || 0),
+            android: Number(msg.calibration?.android || 0),
+            default: Number(msg.calibration?.default || 0)
+          }
         };
       } else {
         command = createPatternCommand(msg.pattern || {
@@ -158,7 +168,7 @@ wss.on("connection", (ws) => {
             { state: "off", duration: 120 },
             { state: "on", duration: 180 }
           ]
-        });
+        }, msg.calibration || {});
       }
 
       const sent = broadcastToEvent(eventCode, command);
