@@ -1,0 +1,15 @@
+{
+  "name": "syncaplus-websocket-live",
+  "version": "1.0.0",
+  "description": "SYNCA+ Stage 6 WebSocket Live Server",
+  "main": "ws-server.js",
+  "scripts": {
+    "start": "node ws-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
