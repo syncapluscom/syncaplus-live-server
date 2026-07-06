@@ -148,7 +148,18 @@ wss.on("connection", (ws) => {
 
       let command;
 
-      if (msg.command === "audio_pattern") {
+      if (msg.command === "stop_loop") {
+        command = {
+          type: "stop",
+          id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
+          startAt: Date.now() + 80,
+          calibration: {
+            ios: Number(msg.calibration?.ios || 0),
+            android: Number(msg.calibration?.android || 0),
+            default: Number(msg.calibration?.default || 0)
+          }
+        };
+      } else if (msg.command === "audio_pattern") {
         command = {
           type: "pattern",
           id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
