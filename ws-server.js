@@ -148,7 +148,25 @@ wss.on("connection", (ws) => {
 
       let command;
 
-      if (msg.command === "flash_test") {
+      if (msg.command === "audio_pattern") {
+        command = {
+          type: "pattern",
+          id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
+          startAt: Date.now() + Number(msg.leadMs || 180),
+          calibration: {
+            ios: Number(msg.calibration?.ios || 0),
+            android: Number(msg.calibration?.android || 0),
+            default: Number(msg.calibration?.default || 0)
+          },
+          pattern: msg.pattern || {
+            name: "Audio Pulse",
+            steps: [
+              { state: "on", duration: 90 },
+              { state: "off", duration: 70 }
+            ]
+          }
+        };
+      } else if (msg.command === "flash_test") {
         command = {
           type: "flash_test",
           id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
