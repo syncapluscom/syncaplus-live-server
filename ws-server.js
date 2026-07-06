@@ -141,14 +141,25 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const command = createPatternCommand(msg.pattern || {
-        name: "Default",
-        steps: [
-          { state: "on", duration: 180 },
-          { state: "off", duration: 120 },
-          { state: "on", duration: 180 }
-        ]
-      });
+      let command;
+
+      if (msg.command === "flash_test") {
+        command = {
+          type: "flash_test",
+          id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
+          startAt: Date.now() + 500,
+          duration: Number(msg.duration || 350)
+        };
+      } else {
+        command = createPatternCommand(msg.pattern || {
+          name: "Default",
+          steps: [
+            { state: "on", duration: 180 },
+            { state: "off", duration: 120 },
+            { state: "on", duration: 180 }
+          ]
+        });
+      }
 
       const sent = broadcastToEvent(eventCode, command);
 
