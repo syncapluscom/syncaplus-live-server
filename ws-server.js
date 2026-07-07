@@ -1,90 +1,168 @@
-// SYNCA+ Stage 6 - WebSocket Live Server
-// Kurulum:
-// npm install
-// npm start
-//
-// Varsayılan port: 3000
-// Render/Railway gibi servislerde PORT env otomatik kullanılır.
+const WebSocket = require("ws");
 
-const http = require("http");
-const { WebSocketServer } = require("ws");
+const PORT = process.env.PORT || 10000;
+const SECRET = process.env.SYNCA_WS_SECRET || "change-this-secret";
 
-const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.SYNCA_WS_SECRET || "change-this-secret";
+const wss = new WebSocket.Server({ port: PORT });
 
-const server = http.createServer((req, res) => {
-  if (req.url === "/" || req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({
-      ok: true,
-      service: "SYNCA+ WebSocket Live Server",
-      clients: clients.size,
-      events: eventClients.size
-    }));
-    return;
-  }
+const rooms = new Map();
 
-  res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify({ ok: false, message: "Not found" }));
-});
+const serverStats = {
+  startedAt: Date.now(),
+  totalConnections: 0,
+  totalMessages: 0,
+  totalBroadcasts: 0,
+  lastBroadcastAt: null,
+  lastBroadcastSent: 0
+};
 
-const wss = new WebSocketServer({ server });
-
-const clients = new Map(); // ws -> meta
-const eventClients = new Map(); // eventCode -> Set(ws)
-
-function safeSend(ws, payload) {
-  if (ws.readyState !== ws.OPEN) return false;
-  ws.send(JSON.stringify(payload));
-  return true;
+function normalizeCode(code) {
+  return String(code || "").trim().toUpperCase();
 }
 
-function addToEvent(eventCode, ws) {
-  if (!eventClients.has(eventCode)) eventClients.set(eventCode, new Set());
-  eventClients.get(eventCode).add(ws);
+function getRoom(code) {
+  const eventCode = normalizeCode(code);
+  if (!rooms.has(eventCode)) rooms.set(eventCode, new Set());
+  return rooms.get(eventCode);
 }
 
-function removeClient(ws) {
-  const meta = clients.get(ws);
-  if (meta?.eventCode && eventClients.has(meta.eventCode)) {
-    eventClients.get(meta.eventCode).delete(ws);
-    if (eventClients.get(meta.eventCode).size === 0) {
-      eventClients.delete(meta.eventCode);
-    }
-  }
-  clients.delete(ws);
-}
-
-function broadcastToEvent(eventCode, payload) {
-  const set = eventClients.get(eventCode);
-  if (!set) return 0;
+function getRoomOnline(code) {
+  const room = rooms.get(normalizeCode(code));
+  if (!room) return 0;
 
   let count = 0;
-  for (const ws of set) {
-    if (safeSend(ws, payload)) count++;
+  for (const client of room) {
+    if (client.readyState === WebSocket.OPEN) count++;
   }
-
   return count;
 }
 
-function createPatternCommand(pattern, calibration = {}) {
-  const startAt = Date.now() + 1200; // tüm cihazlar için ortak başlangıç
+function roomBroadcast(code, payload, except = null) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return 0;
+
+  const data = JSON.stringify(payload);
+  let sent = 0;
+
+  for (const client of room) {
+    if (client !== except && client.readyState === WebSocket.OPEN) {
+      client.send(data);
+      sent++;
+    }
+  }
+
+  return sent;
+}
+
+function sendOnlineToPanels(code) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return;
+
+  const online = getRoomOnline(eventCode);
+  const payload = JSON.stringify({
+    type: "online",
+    eventCode,
+    online,
+    serverTime: Date.now()
+  });
+
+  for (const client of room) {
+    if (client.role === "panel" && client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+function sendHealth(ws, code) {
+  const eventCode = normalizeCode(code || ws.eventCode);
+  if (!eventCode || ws.readyState !== WebSocket.OPEN) return;
+
+  ws.send(JSON.stringify({
+    type: "health",
+    eventCode,
+    online: getRoomOnline(eventCode),
+    uptimeSec: Math.round((Date.now() - serverStats.startedAt) / 1000),
+    totalConnections: serverStats.totalConnections,
+    totalMessages: serverStats.totalMessages,
+    totalBroadcasts: serverStats.totalBroadcasts,
+    lastBroadcastAt: serverStats.lastBroadcastAt,
+    lastBroadcastSent: serverStats.lastBroadcastSent,
+    serverTime: Date.now()
+  }));
+}
+
+function attachClient(ws, code, role) {
+  const eventCode = normalizeCode(code);
+  if (!eventCode) return false;
+
+  if (ws.eventCode && rooms.has(ws.eventCode)) {
+    rooms.get(ws.eventCode).delete(ws);
+  }
+
+  ws.eventCode = eventCode;
+  ws.role = role || "phone";
+  getRoom(eventCode).add(ws);
+  sendOnlineToPanels(eventCode);
+  return true;
+}
+
+function createPatternCommand(msg) {
+  const now = Date.now();
+  const startAt = Number(msg.startAt || 0) || (now + Number(msg.leadMs || 180));
+
   return {
     type: "pattern",
-    id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
+    id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
     startAt,
-    calibration: {
-      ios: Number(calibration.ios || 0),
-      android: Number(calibration.android || 0),
-      default: Number(calibration.default || 0)
+    pattern: msg.pattern || {
+      name: "Flash",
+      steps: [{ state: "on", duration: 250 }, { state: "off", duration: 120 }]
     },
-    pattern
+    calibration: {
+      ios: Number(msg.calibration?.ios || 0),
+      android: Number(msg.calibration?.android || 0),
+      default: Number(msg.calibration?.default || 0)
+    }
+  };
+}
+
+function createStopCommand(msg) {
+  const now = Date.now();
+  return {
+    type: "stop",
+    id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
+    startAt: now + 60,
+    calibration: {
+      ios: Number(msg.calibration?.ios || 0),
+      android: Number(msg.calibration?.android || 0),
+      default: Number(msg.calibration?.default || 0)
+    }
+  };
+}
+
+function createFlashTestCommand(msg) {
+  const now = Date.now();
+  return {
+    type: "flash_test",
+    id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
+    startAt: now + Number(msg.leadMs || 180),
+    duration: Number(msg.duration || 350),
+    calibration: {
+      ios: Number(msg.calibration?.ios || 0),
+      android: Number(msg.calibration?.android || 0),
+      default: Number(msg.calibration?.default || 0)
+    }
   };
 }
 
 wss.on("connection", (ws) => {
   serverStats.totalConnections++;
+
   ws.isAlive = true;
+  ws.role = "unknown";
+  ws.eventCode = "";
 
   ws.on("pong", () => {
     ws.isAlive = true;
@@ -92,188 +170,143 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (raw) => {
     serverStats.totalMessages++;
-    let msg;
 
+    let msg;
     try {
       msg = JSON.parse(raw.toString());
-    } catch {
-      safeSend(ws, { type: "error", message: "Invalid JSON" });
+    } catch (e) {
+      ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
       return;
     }
 
-    if (msg.type === "panel_join") {
-      ws.role = "panel";
-      ws.eventCode = String(msg.eventCode || "").trim().toUpperCase();
-      sendHealth(ws, ws.eventCode);
-      return;
-    }
+    const type = msg.type;
 
-    if (msg.type === "ping") {
+    if (type === "ping") {
       ws.send(JSON.stringify({
         type: "pong",
         clientTime: msg.clientTime || null,
         serverTime: Date.now(),
-        eventCode: ws.eventCode || msg.eventCode || ""
+        eventCode: ws.eventCode || normalizeCode(msg.eventCode)
       }));
       return;
     }
 
-    if (msg.type === "health_request") {
-      const eventCode = String(msg.eventCode || ws.eventCode || "").trim().toUpperCase();
+    if (type === "health_request") {
+      sendHealth(ws, msg.eventCode || ws.eventCode);
+      return;
+    }
+
+    if (type === "panel_join") {
+      const eventCode = normalizeCode(msg.eventCode);
+      if (!eventCode) {
+        ws.send(JSON.stringify({ type: "error", message: "Event code missing" }));
+        return;
+      }
+
+      attachClient(ws, eventCode, "panel");
+      ws.send(JSON.stringify({
+        type: "panel_joined",
+        eventCode,
+        online: getRoomOnline(eventCode),
+        serverTime: Date.now()
+      }));
       sendHealth(ws, eventCode);
       return;
     }
 
-    if (msg.type === "join") {
-      const eventCode = String(msg.eventCode || "").trim();
-
+    if (type === "join") {
+      const eventCode = normalizeCode(msg.eventCode);
       if (!eventCode) {
-        safeSend(ws, { type: "error", message: "eventCode missing" });
+        ws.send(JSON.stringify({ type: "error", message: "Event code missing" }));
         return;
       }
 
-      removeClient(ws);
+      attachClient(ws, eventCode, "phone");
+      ws.deviceToken = msg.deviceToken || "";
+      ws.ua = msg.ua || "";
 
-      const meta = {
-        role: "phone",
-        eventCode,
-        deviceToken: String(msg.deviceToken || ""),
-        ua: String(msg.ua || "")
-      };
-
-      clients.set(ws, meta);
-      addToEvent(eventCode, ws);
-
-      safeSend(ws, {
+      ws.send(JSON.stringify({
         type: "joined",
         eventCode,
         serverTime: Date.now(),
-        online: eventClients.get(eventCode)?.size || 0
-      });
-
-      broadcastToEvent(eventCode, {
-        type: "online",
-        online: eventClients.get(eventCode)?.size || 0
-      });
+        online: getRoomOnline(eventCode)
+      }));
 
       return;
     }
 
-    if (msg.type === "control") {
-      if (String(msg.secret || "") !== API_SECRET) {
-        safeSend(ws, { type: "error", message: "unauthorized" });
+    if (type === "control") {
+      if (msg.secret !== SECRET) {
+        ws.send(JSON.stringify({ type: "error", message: "Unauthorized" }));
         return;
       }
 
-      const eventCode = String(msg.eventCode || "").trim();
+      const eventCode = normalizeCode(msg.eventCode || ws.eventCode);
       if (!eventCode) {
-        safeSend(ws, { type: "error", message: "eventCode missing" });
+        ws.send(JSON.stringify({ type: "error", message: "Event code missing" }));
         return;
       }
 
       let command;
-
       if (msg.command === "stop_loop") {
-        command = {
-          type: "stop",
-          id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
-          startAt: Date.now() + 80,
-          calibration: {
-            ios: Number(msg.calibration?.ios || 0),
-            android: Number(msg.calibration?.android || 0),
-            default: Number(msg.calibration?.default || 0)
-          }
-        };
-      } else if (msg.command === "audio_pattern") {
-        command = {
-          type: "pattern",
-          id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
-          startAt: Date.now() + Number(msg.leadMs || 180),
-          calibration: {
-            ios: Number(msg.calibration?.ios || 0),
-            android: Number(msg.calibration?.android || 0),
-            default: Number(msg.calibration?.default || 0)
-          },
-          pattern: msg.pattern || {
-            name: "Audio Pulse",
-            steps: [
-              { state: "on", duration: 90 },
-              { state: "off", duration: 70 }
-            ]
-          }
-        };
+        command = createStopCommand(msg);
       } else if (msg.command === "flash_test") {
-        command = {
-          type: "flash_test",
-          id: "cmd_" + Date.now() + "_" + Math.random().toString(16).slice(2),
-          startAt: Date.now() + 900,
-          duration: Number(msg.duration || 350),
-          calibration: {
-            ios: Number(msg.calibration?.ios || 0),
-            android: Number(msg.calibration?.android || 0),
-            default: Number(msg.calibration?.default || 0)
-          }
-        };
+        command = createFlashTestCommand(msg);
       } else {
-        command = createPatternCommand(msg.pattern || {
-          name: "Default",
-          steps: [
-            { state: "on", duration: 180 },
-            { state: "off", duration: 120 },
-            { state: "on", duration: 180 }
-          ]
-        }, msg.calibration || {});
+        command = createPatternCommand(msg);
       }
 
-      const sent = broadcastToEvent(eventCode, command);
+      const sent = roomBroadcast(eventCode, command, null);
 
-      safeSend(ws, {
+      serverStats.totalBroadcasts++;
+      serverStats.lastBroadcastAt = Date.now();
+      serverStats.lastBroadcastSent = sent;
+
+      ws.send(JSON.stringify({
         type: "sent",
-        eventCode,
         sent,
-        command
-      });
+        eventCode,
+        commandType: command.type,
+        serverTime: Date.now()
+      }));
 
+      sendOnlineToPanels(eventCode);
       return;
     }
 
-    if (msg.type === "ping") {
-      safeSend(ws, { type: "pong", serverTime: Date.now() });
-      return;
-    }
+    ws.send(JSON.stringify({ type: "error", message: "Unknown message type: " + type }));
   });
 
   ws.on("close", () => {
-    const meta = clients.get(ws);
-    const eventCode = meta?.eventCode;
-    removeClient(ws);
-
-    if (eventCode) {
-      broadcastToEvent(eventCode, {
-        type: "online",
-        online: eventClients.get(eventCode)?.size || 0
-      });
+    if (ws.eventCode && rooms.has(ws.eventCode)) {
+      const eventCode = ws.eventCode;
+      rooms.get(eventCode).delete(ws);
+      sendOnlineToPanels(eventCode);
     }
   });
 
-  ws.on("error", () => {
-    removeClient(ws);
-  });
+  ws.on("error", () => {});
 });
 
 setInterval(() => {
   for (const ws of wss.clients) {
-    if (!ws.isAlive) {
-      removeClient(ws);
-      ws.terminate();
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch (e) {}
       continue;
     }
 
     ws.isAlive = false;
-    ws.ping();
+    try { ws.ping(); } catch (e) {}
   }
 }, 30000);
 
-server.listen(PORT, () => {
-  console.log(`SYNCA+ WebSocket Live Server running on :${PORT}`);
-});
+setInterval(() => {
+  for (const [eventCode, room] of rooms.entries()) {
+    for (const client of [...room]) {
+      if (client.readyState !== WebSocket.OPEN) room.delete(client);
+    }
+    sendOnlineToPanels(eventCode);
+  }
+}, 5000);
+
+console.log("SYNCA+ WebSocket Live Server running on :" + PORT);
