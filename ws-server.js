@@ -83,6 +83,7 @@ function createPatternCommand(pattern, calibration = {}) {
 }
 
 wss.on("connection", (ws) => {
+  serverStats.totalConnections++;
   ws.isAlive = true;
 
   ws.on("pong", () => {
@@ -90,12 +91,36 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("message", (raw) => {
+    serverStats.totalMessages++;
     let msg;
 
     try {
       msg = JSON.parse(raw.toString());
     } catch {
       safeSend(ws, { type: "error", message: "Invalid JSON" });
+      return;
+    }
+
+    if (msg.type === "panel_join") {
+      ws.role = "panel";
+      ws.eventCode = String(msg.eventCode || "").trim().toUpperCase();
+      sendHealth(ws, ws.eventCode);
+      return;
+    }
+
+    if (msg.type === "ping") {
+      ws.send(JSON.stringify({
+        type: "pong",
+        clientTime: msg.clientTime || null,
+        serverTime: Date.now(),
+        eventCode: ws.eventCode || msg.eventCode || ""
+      }));
+      return;
+    }
+
+    if (msg.type === "health_request") {
+      const eventCode = String(msg.eventCode || ws.eventCode || "").trim().toUpperCase();
+      sendHealth(ws, eventCode);
       return;
     }
 
