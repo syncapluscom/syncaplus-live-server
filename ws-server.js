@@ -6,6 +6,21 @@ const SECRET = process.env.SYNCA_WS_SECRET || "change-this-secret";
 const wss = new WebSocket.Server({ port: PORT });
 
 const rooms = new Map();
+const roomStats = new Map();
+const seenDevices = new Map();
+
+function getRoomStats(code) {
+  const eventCode = normalizeCode(code);
+  if (!roomStats.has(eventCode)) {
+    roomStats.set(eventCode, {
+      joined: 0, reconnects: 0, disconnects: 0,
+      commands: 0, ackTotal: 0,
+      lastCommandId: null, lastSent: 0, lastAck: 0,
+      lastBroadcastDurationMs: 0, lastBroadcastAt: null
+    });
+  }
+  return roomStats.get(eventCode);
+}
 
 const serverStats = {
   startedAt: Date.now(),
@@ -24,6 +39,16 @@ function getRoom(code) {
   const eventCode = normalizeCode(code);
   if (!rooms.has(eventCode)) rooms.set(eventCode, new Set());
   return rooms.get(eventCode);
+}
+
+function getRoomPhoneOnline(code) {
+  const room = rooms.get(normalizeCode(code));
+  if (!room) return 0;
+  let count = 0;
+  for (const client of room) {
+    if (client.role === "phone" && client.readyState === WebSocket.OPEN) count++;
+  }
+  return count;
 }
 
 function getRoomOnline(code) {
@@ -46,13 +71,40 @@ function roomBroadcast(code, payload, except = null) {
   let sent = 0;
 
   for (const client of room) {
-    if (client !== except && client.readyState === WebSocket.OPEN) {
+    if (client !== except && client.role === "phone" && client.readyState === WebSocket.OPEN) {
       client.send(data);
       sent++;
     }
   }
 
   return sent;
+}
+
+function sendAudioStatusToPanels(code, extra = {}) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return;
+
+  let source = null;
+  for (const client of room) {
+    if (client.role === "audio_source" && client.readyState === WebSocket.OPEN) {
+      source = client;
+      break;
+    }
+  }
+
+  const payload = JSON.stringify({
+    type: "audio_source_status",
+    eventCode,
+    online: !!source,
+    sourceLabel: source?.sourceLabel || extra.sourceLabel || "",
+    modeLabel: source?.modeLabel || extra.modeLabel || "",
+    serverTime: Date.now()
+  });
+
+  for (const client of room) {
+    if (client.role === "panel" && client.readyState === WebSocket.OPEN) client.send(payload);
+  }
 }
 
 function sendOnlineToPanels(code) {
@@ -75,6 +127,33 @@ function sendOnlineToPanels(code) {
   }
 }
 
+function sendPerformanceToPanels(code) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return;
+  const st = getRoomStats(eventCode);
+  const payload = JSON.stringify({
+    type: "performance",
+    eventCode,
+    phoneOnline: getRoomPhoneOnline(eventCode),
+    joined: st.joined,
+    reconnects: st.reconnects,
+    disconnects: st.disconnects,
+    commands: st.commands,
+    lastCommandId: st.lastCommandId,
+    lastSent: st.lastSent,
+    lastAck: st.lastAck,
+    pending: Math.max(0, st.lastSent - st.lastAck),
+    deliveryRate: st.lastSent ? Number(((st.lastAck / st.lastSent) * 100).toFixed(2)) : 100,
+    broadcastDurationMs: st.lastBroadcastDurationMs,
+    lastBroadcastAt: st.lastBroadcastAt,
+    serverTime: Date.now()
+  });
+  for (const client of room) {
+    if (client.role === "panel" && client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}
+
 function sendHealth(ws, code) {
   const eventCode = normalizeCode(code || ws.eventCode);
   if (!eventCode || ws.readyState !== WebSocket.OPEN) return;
@@ -83,6 +162,7 @@ function sendHealth(ws, code) {
     type: "health",
     eventCode,
     online: getRoomOnline(eventCode),
+    phoneOnline: getRoomPhoneOnline(eventCode),
     uptimeSec: Math.round((Date.now() - serverStats.startedAt) / 1000),
     totalConnections: serverStats.totalConnections,
     totalMessages: serverStats.totalMessages,
@@ -208,9 +288,33 @@ wss.on("connection", (ws) => {
         type: "panel_joined",
         eventCode,
         online: getRoomOnline(eventCode),
+        phoneOnline: getRoomPhoneOnline(eventCode),
         serverTime: Date.now()
       }));
       sendHealth(ws, eventCode);
+      sendAudioStatusToPanels(eventCode);
+      return;
+    }
+
+    if (type === "audio_source_join") {
+      const eventCode = normalizeCode(msg.eventCode);
+      if (!eventCode || msg.secret !== SECRET) {
+        ws.send(JSON.stringify({ type: "error", message: "Unauthorized audio source" }));
+        return;
+      }
+      attachClient(ws, eventCode, "audio_source");
+      ws.sourceLabel = String(msg.sourceLabel || "Ses bilgisayarı");
+      ws.modeLabel = String(msg.modeLabel || "Hazır");
+      ws.send(JSON.stringify({ type: "audio_source_joined", eventCode, serverTime: Date.now() }));
+      sendAudioStatusToPanels(eventCode);
+      return;
+    }
+
+    if (type === "audio_source_heartbeat") {
+      if (ws.role !== "audio_source") return;
+      ws.sourceLabel = String(msg.sourceLabel || ws.sourceLabel || "Ses bilgisayarı");
+      ws.modeLabel = String(msg.modeLabel || ws.modeLabel || "Aktif");
+      sendAudioStatusToPanels(ws.eventCode);
       return;
     }
 
@@ -222,7 +326,12 @@ wss.on("connection", (ws) => {
       }
 
       attachClient(ws, eventCode, "phone");
-      ws.deviceToken = msg.deviceToken || "";
+      ws.deviceToken = msg.deviceToken || ("anon_" + Math.random().toString(16).slice(2));
+      const st = getRoomStats(eventCode);
+      if (!seenDevices.has(eventCode)) seenDevices.set(eventCode, new Set());
+      const devices = seenDevices.get(eventCode);
+      if (devices.has(ws.deviceToken)) st.reconnects++; else { devices.add(ws.deviceToken); st.joined++; }
+
       ws.ua = msg.ua || "";
 
       ws.send(JSON.stringify({
@@ -232,6 +341,20 @@ wss.on("connection", (ws) => {
         online: getRoomOnline(eventCode)
       }));
 
+      sendPerformanceToPanels(eventCode);
+      return;
+    }
+
+    if (type === "ack") {
+      const eventCode = normalizeCode(msg.eventCode || ws.eventCode);
+      if (!eventCode || ws.role !== "phone") return;
+      const st = getRoomStats(eventCode);
+      if (msg.commandId && msg.commandId === st.lastCommandId && ws.lastAckCommandId !== msg.commandId) {
+        ws.lastAckCommandId = msg.commandId;
+        st.lastAck++;
+        st.ackTotal++;
+        if (st.lastAck === st.lastSent || st.lastAck % 25 === 0) sendPerformanceToPanels(eventCode);
+      }
       return;
     }
 
@@ -256,7 +379,16 @@ wss.on("connection", (ws) => {
         command = createPatternCommand(msg);
       }
 
+      const broadcastStarted = process.hrtime.bigint();
       const sent = roomBroadcast(eventCode, command, null);
+      const broadcastDurationMs = Number(process.hrtime.bigint() - broadcastStarted) / 1e6;
+      const st = getRoomStats(eventCode);
+      st.commands++;
+      st.lastCommandId = command.id;
+      st.lastSent = sent;
+      st.lastAck = 0;
+      st.lastBroadcastDurationMs = Number(broadcastDurationMs.toFixed(3));
+      st.lastBroadcastAt = Date.now();
 
       serverStats.totalBroadcasts++;
       serverStats.lastBroadcastAt = Date.now();
@@ -267,10 +399,13 @@ wss.on("connection", (ws) => {
         sent,
         eventCode,
         commandType: command.type,
-        serverTime: Date.now()
+        serverTime: Date.now(),
+        commandId: command.id,
+        broadcastDurationMs: st.lastBroadcastDurationMs
       }));
 
       sendOnlineToPanels(eventCode);
+      sendPerformanceToPanels(eventCode);
       return;
     }
 
@@ -281,7 +416,10 @@ wss.on("connection", (ws) => {
     if (ws.eventCode && rooms.has(ws.eventCode)) {
       const eventCode = ws.eventCode;
       rooms.get(eventCode).delete(ws);
+      if (ws.role === "phone") getRoomStats(eventCode).disconnects++;
       sendOnlineToPanels(eventCode);
+      sendPerformanceToPanels(eventCode);
+      sendAudioStatusToPanels(eventCode);
     }
   });
 
@@ -306,6 +444,7 @@ setInterval(() => {
       if (client.readyState !== WebSocket.OPEN) room.delete(client);
     }
     sendOnlineToPanels(eventCode);
+    sendPerformanceToPanels(eventCode);
   }
 }, 5000);
 
