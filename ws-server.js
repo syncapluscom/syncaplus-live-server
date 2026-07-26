@@ -244,6 +244,7 @@ function createColorCommand(msg) {
     id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
     startAt: now + Number(msg.leadMs || 180),
     color: String(msg.color || "#ffffff"),
+    torchMode: !!msg.torchMode,
     calibration: {
       ios: Number(msg.calibration?.ios || 0),
       android: Number(msg.calibration?.android || 0),
