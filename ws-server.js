@@ -379,10 +379,23 @@ function finishRaffle(code) {
   const state = raffleState.get(eventCode);
   if (!state) return;
   state.active = false;
+  if (state.timer) clearTimeout(state.timer);
 
-  const winner = [...state.remaining][0];
+  const remainingArr = [...state.remaining];
+  const winner = remainingArr.length
+    ? remainingArr[Math.floor(Math.random() * remainingArr.length)]
+    : null;
+
   if (winner && winner.readyState === WebSocket.OPEN) {
     winner.send(JSON.stringify({ type: "raffle_winner", eventCode, serverTime: Date.now() }));
+  }
+
+  // "Bitir" ile erken sonlandırıldığında hâlâ oyunda olan ama kazanmayan herkese de haber ver —
+  // yoksa flaşlarını kaldırmış şekilde sonsuza kadar beklerler.
+  for (const client of remainingArr) {
+    if (client !== winner && client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: "raffle_eliminate", eventCode, serverTime: Date.now() }));
+    }
   }
 
   raffleBroadcastUpdate(eventCode, { finished: true, hasWinner: !!winner });
@@ -542,6 +555,16 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({
           type: "sent", sent: 0, eventCode,
           commandType: "raffle_stop", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+      if (msg.command === "raffle_finish") {
+        const stateBefore = raffleState.get(eventCode);
+        const remainingCount = stateBefore ? stateBefore.remaining.size : 0;
+        finishRaffle(eventCode); // kalanlar arasından rastgele kazanan seçip düzgün bitirir
+        ws.send(JSON.stringify({
+          type: "sent", sent: remainingCount, eventCode,
+          commandType: "raffle_finish", serverTime: Date.now(), broadcastDurationMs: 0
         }));
         return;
       }
