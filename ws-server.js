@@ -255,7 +255,7 @@ function createColorCommand(msg) {
 
 function createCountdownCommand(msg) {
   const now = Date.now();
-  const seconds = Math.max(1, Math.min(120, Number(msg.seconds || 10)));
+  const seconds = Math.max(1, Math.min(120, Number(msg.seconds || 5)));
   return {
     type: "countdown",
     id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
@@ -310,7 +310,8 @@ function scheduleNextElimination(code) {
     return;
   }
 
-  const delay = state.remaining.size <= 5 ? state.finalIntervalMs : state.intervalMs;
+  const inFinalStretch = state.remaining.size <= 5;
+  const delay = inFinalStretch ? state.finalIntervalMs : state.intervalMs;
 
   state.timer = setTimeout(() => {
     const current = raffleState.get(eventCode);
@@ -319,11 +320,25 @@ function scheduleNextElimination(code) {
     if (current.remaining.size <= 1) { finishRaffle(eventCode); return; }
 
     const arr = [...current.remaining];
-    const pick = arr[Math.floor(Math.random() * arr.length)];
-    current.remaining.delete(pick);
 
-    if (pick.readyState === WebSocket.OPEN) {
-      pick.send(JSON.stringify({ type: "raffle_eliminate", eventCode, serverTime: Date.now() }));
+    // Kalabalık büyükken (5'ten fazla kişi kaldıysa) her turda tek kişi değil,
+    // kalanların yaklaşık yarısını aynı anda eleyerek hızlı daralma sağlıyoruz.
+    // Aksi halde 2000 kişide tek-tek eleme ~40 dakika sürerdi.
+    let eliminateCount = 1;
+    if (current.remaining.size > 5) {
+      eliminateCount = Math.max(1, Math.floor(current.remaining.size * 0.5));
+      eliminateCount = Math.min(eliminateCount, current.remaining.size - 5);
+      if (eliminateCount < 1) eliminateCount = 1;
+    }
+
+    for (let i = 0; i < eliminateCount; i++) {
+      const idx = Math.floor(Math.random() * arr.length);
+      const pick = arr.splice(idx, 1)[0];
+      current.remaining.delete(pick);
+
+      if (pick && pick.readyState === WebSocket.OPEN) {
+        pick.send(JSON.stringify({ type: "raffle_eliminate", eventCode, serverTime: Date.now() }));
+      }
     }
 
     raffleBroadcastUpdate(eventCode);
