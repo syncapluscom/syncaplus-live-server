@@ -237,6 +237,143 @@ function createFlashTestCommand(msg) {
   };
 }
 
+function createColorCommand(msg) {
+  const now = Date.now();
+  return {
+    type: "color",
+    id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
+    startAt: now + Number(msg.leadMs || 180),
+    color: String(msg.color || "#ffffff"),
+    calibration: {
+      ios: Number(msg.calibration?.ios || 0),
+      android: Number(msg.calibration?.android || 0),
+      default: Number(msg.calibration?.default || 0)
+    }
+  };
+}
+
+function createCountdownCommand(msg) {
+  const now = Date.now();
+  const seconds = Math.max(1, Math.min(120, Number(msg.seconds || 10)));
+  return {
+    type: "countdown",
+    id: "cmd_" + now + "_" + Math.random().toString(16).slice(2),
+    seconds,
+    startAt: now + Number(msg.leadMs || 300)
+  };
+}
+
+/* ---------------- ÇEKİLİŞ (RAFFLE) ----------------
+   Sunucu otoritesi: hangi telefonların hâlâ oyunda olduğunu tutar,
+   rastgele aralıklarla tek tek eler, son kalanı kazanan ilan eder. */
+const raffleState = new Map(); // eventCode -> { active, remaining:Set<ws>, timer, intervalMs, finalIntervalMs }
+
+function getPhoneClients(code) {
+  const room = rooms.get(normalizeCode(code));
+  if (!room) return [];
+  return [...room].filter((c) => c.role === "phone" && c.readyState === WebSocket.OPEN);
+}
+
+function raffleBroadcastUpdate(code, extra = {}) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return;
+  const state = raffleState.get(eventCode);
+  const payload = JSON.stringify({
+    type: "raffle_update",
+    eventCode,
+    remaining: state ? state.remaining.size : 0,
+    active: state ? state.active : false,
+    serverTime: Date.now(),
+    ...extra
+  });
+  for (const client of room) {
+    if (client.role === "panel" && client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}
+
+function stopRaffle(code) {
+  const eventCode = normalizeCode(code);
+  const state = raffleState.get(eventCode);
+  if (state && state.timer) clearTimeout(state.timer);
+  raffleState.delete(eventCode);
+}
+
+function scheduleNextElimination(code) {
+  const eventCode = normalizeCode(code);
+  const state = raffleState.get(eventCode);
+  if (!state || !state.active) return;
+
+  if (state.remaining.size <= 1) {
+    finishRaffle(eventCode);
+    return;
+  }
+
+  const delay = state.remaining.size <= 5 ? state.finalIntervalMs : state.intervalMs;
+
+  state.timer = setTimeout(() => {
+    const current = raffleState.get(eventCode);
+    if (!current || !current.active) return;
+
+    if (current.remaining.size <= 1) { finishRaffle(eventCode); return; }
+
+    const arr = [...current.remaining];
+    const pick = arr[Math.floor(Math.random() * arr.length)];
+    current.remaining.delete(pick);
+
+    if (pick.readyState === WebSocket.OPEN) {
+      pick.send(JSON.stringify({ type: "raffle_eliminate", eventCode, serverTime: Date.now() }));
+    }
+
+    raffleBroadcastUpdate(eventCode);
+    scheduleNextElimination(eventCode);
+  }, delay);
+}
+
+function startRaffle(code, opts) {
+  const eventCode = normalizeCode(code);
+  stopRaffle(eventCode);
+
+  const phones = getPhoneClients(eventCode);
+  const remaining = new Set(phones);
+
+  const state = {
+    active: true,
+    remaining,
+    timer: null,
+    intervalMs: Math.max(300, Number(opts.intervalMs || 1200)),
+    finalIntervalMs: Math.max(500, Number(opts.finalIntervalMs || 2500))
+  };
+  raffleState.set(eventCode, state);
+
+  // Herkese "flaşını kaldır" komutu — tam ekran/torch yanık kalır
+  roomBroadcast(eventCode, { type: "raffle_start", id: "raffle_" + Date.now(), startAt: Date.now() + 250 }, null);
+  raffleBroadcastUpdate(eventCode);
+
+  if (remaining.size <= 1) {
+    finishRaffle(eventCode);
+  } else {
+    scheduleNextElimination(eventCode);
+  }
+  return remaining.size;
+}
+
+function finishRaffle(code) {
+  const eventCode = normalizeCode(code);
+  const state = raffleState.get(eventCode);
+  if (!state) return;
+  state.active = false;
+
+  const winner = [...state.remaining][0];
+  if (winner && winner.readyState === WebSocket.OPEN) {
+    winner.send(JSON.stringify({ type: "raffle_winner", eventCode, serverTime: Date.now() }));
+  }
+
+  raffleBroadcastUpdate(eventCode, { finished: true, hasWinner: !!winner });
+  raffleState.delete(eventCode);
+}
+/* ---------------- /ÇEKİLİŞ ---------------- */
+
 wss.on("connection", (ws) => {
   serverStats.totalConnections++;
 
@@ -370,11 +507,40 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      // --- Çekiliş: normal broadcast akışının dışında, kendi mantığı var ---
+      if (msg.command === "raffle_start") {
+        const remaining = startRaffle(eventCode, {
+          intervalMs: msg.intervalMs,
+          finalIntervalMs: msg.finalIntervalMs
+        });
+        ws.send(JSON.stringify({
+          type: "sent", sent: remaining, eventCode,
+          commandType: "raffle_start", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+      if (msg.command === "raffle_stop") {
+        stopRaffle(eventCode);
+        roomBroadcast(eventCode, { type: "raffle_cancelled", serverTime: Date.now() }, null);
+        raffleBroadcastUpdate(eventCode);
+        ws.send(JSON.stringify({
+          type: "sent", sent: 0, eventCode,
+          commandType: "raffle_stop", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
       let command;
       if (msg.command === "stop_loop") {
         command = createStopCommand(msg);
+        stopRaffle(eventCode); // acil kapat, çekilişi de iptal etsin
+        raffleBroadcastUpdate(eventCode, { finished: true, hasWinner: false });
       } else if (msg.command === "flash_test") {
         command = createFlashTestCommand(msg);
+      } else if (msg.command === "set_color") {
+        command = createColorCommand(msg);
+      } else if (msg.command === "countdown") {
+        command = createCountdownCommand(msg);
       } else {
         command = createPatternCommand(msg);
       }
