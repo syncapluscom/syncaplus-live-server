@@ -8,6 +8,7 @@ const wss = new WebSocket.Server({ port: PORT });
 const rooms = new Map();
 const roomStats = new Map();
 const seenDevices = new Map();
+const roomCaps = new Map(); // eventCode -> sayı (Demo: 25) | null (Pro: sınırsız) | tanımsız (henüz panel bağlanmadı)
 
 function getRoomStats(code) {
   const eventCode = normalizeCode(code);
@@ -68,16 +69,29 @@ function roomBroadcast(code, payload, except = null) {
   if (!room) return 0;
 
   const data = JSON.stringify(payload);
-  let sent = 0;
-
+  const targets = [];
   for (const client of room) {
     if (client !== except && client.role === "phone" && client.readyState === WebSocket.OPEN) {
-      client.send(data);
-      sent++;
+      targets.push(client);
     }
   }
 
-  return sent;
+  // Kalabalık (binlerce telefon) varken tek seferde senkron gönderim event loop'u
+  // tıkayıp ping/pong işlenmesini geciktiriyordu — sunucu telefonları yanlışlıkla
+  // "koptu" sanıp kapatıyordu. Bunun yerine küçük gruplar halinde, aralarında
+  // event loop'a nefes payı bırakarak gönderiyoruz.
+  const BATCH_SIZE = 250;
+  let i = 0;
+  function sendBatch() {
+    const end = Math.min(i + BATCH_SIZE, targets.length);
+    for (; i < end; i++) {
+      try { targets[i].send(data); } catch (e) {}
+    }
+    if (i < targets.length) setImmediate(sendBatch);
+  }
+  sendBatch();
+
+  return targets.length;
 }
 
 function sendAudioStatusToPanels(code, extra = {}) {
@@ -448,6 +462,15 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({ type: "error", message: "Event code missing" }));
         return;
       }
+      if (msg.secret !== SECRET) {
+        ws.send(JSON.stringify({ type: "error", message: "Unauthorized panel" }));
+        return;
+      }
+
+      // Panel bağlandığında etkinliğin katılımcı sınırını (Demo: 25, Pro: sınırsız)
+      // otoriter şekilde güncelliyoruz — bu değer PHP tarafında veritabanından
+      // hesaplanıp panele iletildiği için güvenilir kaynak burasıdır.
+      roomCaps.set(eventCode, msg.maxParticipants === null || msg.maxParticipants === undefined ? null : Number(msg.maxParticipants));
 
       attachClient(ws, eventCode, "panel");
       ws.send(JSON.stringify({
@@ -489,6 +512,26 @@ wss.on("connection", (ws) => {
       if (!eventCode) {
         ws.send(JSON.stringify({ type: "error", message: "Event code missing" }));
         return;
+      }
+
+      // Panel henüz hiç bağlanmadıysa, ilk gelen telefonun bildirdiği sınırı
+      // geçici olarak benimse (panel bağlanınca gerçek/doğrulanmış değerle güncellenir).
+      if (!roomCaps.has(eventCode)) {
+        roomCaps.set(eventCode, msg.maxParticipants === null || msg.maxParticipants === undefined ? null : Number(msg.maxParticipants));
+      }
+
+      const cap = roomCaps.get(eventCode);
+      if (typeof cap === "number" && !Number.isNaN(cap)) {
+        const currentPhoneCount = getRoomPhoneOnline(eventCode);
+        if (currentPhoneCount >= cap) {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "capacity_full",
+            message: "Bu etkinlik Demo modunda — en fazla " + cap + " katılımcı bağlanabilir. Pro'ya geçmek için etkinlik sahibiyle iletişime geç."
+          }));
+          try { ws.close(); } catch (e) {}
+          return;
+        }
       }
 
       attachClient(ws, eventCode, "phone");
