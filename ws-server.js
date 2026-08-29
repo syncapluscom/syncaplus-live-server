@@ -251,6 +251,84 @@ function createFlashTestCommand(msg) {
   };
 }
 
+// ============ KOLTUK NUMARASI TABANLI IŞIK DALGASI ============
+// Her telefona AYNI komut değil, koltuk konumuna göre HESAPLANMIŞ farklı bir
+// başlangıç anı (startAt) gönderilir — bu da fiziksel bir ışık dalgası hissi yaratır.
+// Koltuk bilgisi hiçbir yerde saklanmaz, sadece bu bağlantı canlıyken bellekte durur.
+function broadcastSeatWave(code, msg) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return 0;
+
+  const direction = msg.direction || "left-to-right";
+  const color = String(msg.color || "#ffffff");
+  const totalDurationMs = Math.max(200, Number(msg.totalDurationMs || 3000));
+  const rows = Number(msg.rows || 1);
+  const cols = Number(msg.cols || 1);
+  const now = Date.now();
+  const leadMs = Number(msg.leadMs || 250);
+
+  const targets = [];
+  for (const client of room) {
+    if (client.role === "phone" && client.readyState === WebSocket.OPEN &&
+        Number.isFinite(client.seatRow) && Number.isFinite(client.seatCol)) {
+      targets.push(client);
+    }
+  }
+  if (!targets.length) return 0;
+
+  const centerRow = rows / 2;
+  const centerCol = cols / 2;
+  const maxRadius = Math.sqrt(centerRow * centerRow + centerCol * centerCol) || 1;
+
+  function rawDelay(row, col) {
+    switch (direction) {
+      case "left-to-right": return col;
+      case "right-to-left": return cols - col;
+      case "top-to-bottom": return row;
+      case "bottom-to-top": return rows - row;
+      case "center-out": return Math.sqrt((row - centerRow) ** 2 + (col - centerCol) ** 2);
+      case "edges-in": return maxRadius - Math.sqrt((row - centerRow) ** 2 + (col - centerCol) ** 2);
+      default: return 0;
+    }
+  }
+
+  let maxRaw = 0;
+  for (const t of targets) {
+    const r = rawDelay(t.seatRow, t.seatCol);
+    if (r > maxRaw) maxRaw = r;
+  }
+  if (maxRaw <= 0) maxRaw = 1;
+
+  for (const t of targets) {
+    const r = rawDelay(t.seatRow, t.seatCol);
+    const offsetMs = (r / maxRaw) * totalDurationMs;
+    const startAt = now + leadMs + offsetMs;
+    try {
+      t.send(JSON.stringify({
+        type: "color",
+        id: "seatwave_" + now + "_" + t.seatRow + "_" + t.seatCol,
+        startAt,
+        color,
+        torchMode: false,
+        calibration: msg.calibration || {}
+      }));
+    } catch (e) {}
+  }
+
+  // Dalga tüm salonu geçtikten kısa bir süre sonra herkes birlikte sönsün.
+  const holdMs = Number(msg.holdMs || 400);
+  setTimeout(() => {
+    for (const t of targets) {
+      if (t.readyState === WebSocket.OPEN) {
+        try { t.send(JSON.stringify({ type: "stop", startAt: Date.now() })); } catch (e) {}
+      }
+    }
+  }, leadMs + totalDurationMs + holdMs);
+
+  return targets.length;
+}
+
 function createColorCommand(msg) {
   const now = Date.now();
   return {
@@ -360,23 +438,69 @@ function scheduleNextElimination(code) {
   }, delay);
 }
 
-function startRaffle(code, opts) {
+function raffleRegBroadcastUpdate(code) {
   const eventCode = normalizeCode(code);
-  stopRaffle(eventCode);
+  const room = rooms.get(eventCode);
+  if (!room) return;
+  const state = raffleState.get(eventCode);
+  const payload = JSON.stringify({
+    type: "raffle_reg_update",
+    eventCode,
+    registered: state ? state.registrants.size : 0,
+    serverTime: Date.now()
+  });
+  for (const client of room) {
+    if (client.role === "panel" && client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}
 
-  const phones = getPhoneClients(eventCode);
-  const remaining = new Set(phones);
+// Çekiliş öncesi rumuz toplama aşamasını açar — herkesin ekranında rumuz girme
+// kutusu belirir. Bu aşamada henüz eleme başlamaz.
+function openRaffleRegistration(code) {
+  const eventCode = normalizeCode(code);
+  stopRaffle(eventCode); // varsa önceki turu temizle
 
   const state = {
+    phase: "registering", // registering -> eliminating -> (silinir)
+    registrants: new Map(), // ws -> rumuz (SADECE bellekte, hiçbir yere kaydedilmez)
+    remaining: new Set(),
+    active: false,
+    timer: null,
+    intervalMs: 1200,
+    finalIntervalMs: 2500
+  };
+  raffleState.set(eventCode, state);
+
+  roomBroadcast(eventCode, { type: "raffle_register_start", eventCode, serverTime: Date.now() }, null);
+  raffleRegBroadcastUpdate(eventCode);
+  return true;
+}
+
+function startRaffle(code, opts) {
+  const eventCode = normalizeCode(code);
+  const state = raffleState.get(eventCode);
+
+  // Rumuz kayıt aşaması hiç açılmadıysa (ör. eski davranışa geri dönülürse),
+  // en azından o an bağlı telefonlarla devam et — sistem asla kilitlenmesin.
+  const registrants = (state && state.phase === "registering")
+    ? state.registrants
+    : new Map(getPhoneClients(eventCode).map((c) => [c, null]));
+
+  const remaining = new Set(registrants.keys());
+
+  const newState = {
+    phase: "eliminating",
+    registrants,
     active: true,
     remaining,
     timer: null,
     intervalMs: Math.max(300, Number(opts.intervalMs || 1200)),
     finalIntervalMs: Math.max(500, Number(opts.finalIntervalMs || 2500))
   };
-  raffleState.set(eventCode, state);
+  raffleState.set(eventCode, newState);
 
-  // Herkese "flaşını kaldır" komutu — tam ekran/torch yanık kalır
+  // Kayıt olmayanlar da dahil herkese "flaşını kaldır" komutu — ekranlar normale döner,
+  // sadece kayıtlı olanlar eleme akışına girer.
   roomBroadcast(eventCode, { type: "raffle_start", id: "raffle_" + Date.now(), startAt: Date.now() + 250 }, null);
   raffleBroadcastUpdate(eventCode);
 
@@ -399,6 +523,7 @@ function finishRaffle(code) {
   const winner = remainingArr.length
     ? remainingArr[Math.floor(Math.random() * remainingArr.length)]
     : null;
+  const winnerNickname = winner ? (state.registrants.get(winner) || null) : null;
 
   if (winner && winner.readyState === WebSocket.OPEN) {
     winner.send(JSON.stringify({ type: "raffle_winner", eventCode, serverTime: Date.now() }));
@@ -412,7 +537,7 @@ function finishRaffle(code) {
     }
   }
 
-  raffleBroadcastUpdate(eventCode, { finished: true, hasWinner: !!winner });
+  raffleBroadcastUpdate(eventCode, { finished: true, hasWinner: !!winner, winnerNickname });
   raffleState.delete(eventCode);
 }
 /* ---------------- /ÇEKİLİŞ ---------------- */
@@ -453,6 +578,20 @@ wss.on("connection", (ws) => {
 
     if (type === "health_request") {
       sendHealth(ws, msg.eventCode || ws.eventCode);
+      return;
+    }
+
+    if (type === "raffle_nickname_submit") {
+      const eventCode = ws.eventCode || normalizeCode(msg.eventCode);
+      const state = raffleState.get(eventCode);
+      if (state && state.phase === "registering") {
+        // Rumuz sadece bu çekiliş turu boyunca bellekte tutulur, hiçbir yere kaydedilmez.
+        let nickname = String(msg.nickname || "").trim().slice(0, 24);
+        if (!nickname) nickname = "İsimsiz";
+        state.registrants.set(ws, nickname);
+        ws.send(JSON.stringify({ type: "raffle_registered", eventCode, serverTime: Date.now() }));
+        raffleRegBroadcastUpdate(eventCode);
+      }
       return;
     }
 
@@ -543,6 +682,13 @@ wss.on("connection", (ws) => {
 
       ws.ua = msg.ua || "";
 
+      // Koltuk numarası SADECE bu bağlantı canlıyken bellekte tutulur, hiçbir yere
+      // kaydedilmez — bağlantı kopunca kaybolur. Işık dalgası efektleri için gerekli.
+      if (Number.isFinite(msg.seatRow) && Number.isFinite(msg.seatCol)) {
+        ws.seatRow = Number(msg.seatRow);
+        ws.seatCol = Number(msg.seatCol);
+      }
+
       ws.send(JSON.stringify({
         type: "joined",
         eventCode,
@@ -580,6 +726,14 @@ wss.on("connection", (ws) => {
       }
 
       // --- Çekiliş: normal broadcast akışının dışında, kendi mantığı var ---
+      if (msg.command === "raffle_open_registration") {
+        openRaffleRegistration(eventCode);
+        ws.send(JSON.stringify({
+          type: "sent", sent: 0, eventCode,
+          commandType: "raffle_open_registration", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
       if (msg.command === "raffle_start") {
         const remaining = startRaffle(eventCode, {
           intervalMs: msg.intervalMs,
@@ -608,6 +762,15 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({
           type: "sent", sent: remainingCount, eventCode,
           commandType: "raffle_finish", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
+      if (msg.command === "seat_wave") {
+        const sent = broadcastSeatWave(eventCode, msg);
+        ws.send(JSON.stringify({
+          type: "sent", sent, eventCode,
+          commandType: "seat_wave", serverTime: Date.now(), broadcastDurationMs: 0
         }));
         return;
       }
@@ -668,6 +831,19 @@ wss.on("connection", (ws) => {
       sendOnlineToPanels(eventCode);
       sendPerformanceToPanels(eventCode);
       sendAudioStatusToPanels(eventCode);
+
+      // Kopan telefon, çekilişte hâlâ kayıtlı/yarışıyor görünüp yanlışlıkla
+      // kazanan seçilmesin diye ilgili listelerden de çıkarılır.
+      const raffle = raffleState.get(eventCode);
+      if (raffle) {
+        let changed = false;
+        if (raffle.registrants && raffle.registrants.delete(ws)) changed = true;
+        if (raffle.remaining && raffle.remaining.delete(ws)) changed = true;
+        if (changed) {
+          if (raffle.phase === "registering") raffleRegBroadcastUpdate(eventCode);
+          else raffleBroadcastUpdate(eventCode);
+        }
+      }
     }
   });
 
