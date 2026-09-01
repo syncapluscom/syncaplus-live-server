@@ -360,6 +360,7 @@ function createCountdownCommand(msg) {
    Sunucu otoritesi: hangi telefonların hâlâ oyunda olduğunu tutar,
    rastgele aralıklarla tek tek eler, son kalanı kazanan ilan eder. */
 const raffleState = new Map(); // eventCode -> { active, remaining:Set<ws>, timer, intervalMs, finalIntervalMs }
+const crowdMapState = new Map(); // eventCode -> { round, targetGroup, votedCount }
 
 function getPhoneClients(code) {
   const room = rooms.get(normalizeCode(code));
@@ -542,6 +543,105 @@ function finishRaffle(code) {
 }
 /* ---------------- /ÇEKİLİŞ ---------------- */
 
+/* ---------------- SEYİRCİ HARİTALA (kalibrasyonla 4 bölge) ---------------- */
+// Hiçbir koltuk numarası önceden bilinmeden — sunucu fiziksel olarak sırayla
+// farklı merkez noktalarına geçip "sağ mısın sol musun" diye sorarak seyirciyi
+// A-Sol / A-Sağ / B-Sol / B-Sağ olmak üzere 4 bölgeye ayırır.
+// Grup bilgisi SADECE bağlantı canlıyken bellekte tutulur, hiçbir yere kaydedilmez.
+
+function crowdMapBroadcastStatus(code) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return;
+  const state = crowdMapState.get(eventCode) || null;
+
+  let leftCount = 0, rightCount = 0;
+  let quadCounts = { "A-Sol": 0, "A-Sağ": 0, "B-Sol": 0, "B-Sağ": 0 };
+  for (const client of room) {
+    if (client.role !== "phone") continue;
+    if (client.crowdQuadrant) quadCounts[client.crowdQuadrant] = (quadCounts[client.crowdQuadrant] || 0) + 1;
+    if (state && state.round === 1 && client.crowdGroup1) {
+      if (client.crowdGroup1 === "A") leftCount++; else rightCount++;
+    }
+    if (state && state.round > 1 && client.crowdGroup1 === state.targetGroup && client.crowdGroup2) {
+      if (client.crowdGroup2 === "Sol") leftCount++; else rightCount++;
+    }
+  }
+
+  const payload = JSON.stringify({
+    type: "crowd_map_status",
+    eventCode,
+    round: state ? state.round : 0,
+    targetGroup: state ? state.targetGroup : null,
+    leftCount,
+    rightCount,
+    quadCounts,
+    serverTime: Date.now()
+  });
+  for (const client of room) {
+    if (client.role === "panel" && client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}
+
+// round: 1 = herkes (A/B ayrımı), 2 = sadece A grubu (A-Sol/A-Sağ), 3 = sadece B grubu (B-Sol/B-Sağ)
+function startCrowdMapRound(code, round) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return 0;
+
+  const targetGroup = round === 2 ? "A" : round === 3 ? "B" : null;
+  crowdMapState.set(eventCode, { round, targetGroup });
+
+  let sentTo = 0;
+  for (const client of room) {
+    if (client.role !== "phone" || client.readyState !== WebSocket.OPEN) continue;
+    const eligible = round === 1 || client.crowdGroup1 === targetGroup;
+    if (!eligible) continue;
+    try {
+      client.send(JSON.stringify({ type: "crowd_map_round", eventCode, round, serverTime: Date.now() }));
+      sentTo++;
+    } catch (e) {}
+  }
+  crowdMapBroadcastStatus(eventCode);
+  return sentTo;
+}
+
+function crowdMapVote(ws, choice) {
+  const eventCode = ws.eventCode;
+  const state = crowdMapState.get(eventCode);
+  if (!state) return;
+
+  if (state.round === 1) {
+    ws.crowdGroup1 = choice === "left" ? "A" : "B";
+  } else if (state.round === 2 && ws.crowdGroup1 === "A") {
+    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
+    ws.crowdQuadrant = "A-" + ws.crowdGroup2;
+  } else if (state.round === 3 && ws.crowdGroup1 === "B") {
+    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
+    ws.crowdQuadrant = "B-" + ws.crowdGroup2;
+  } else {
+    return; // bu turda oy kullanmaya uygun değil
+  }
+
+  ws.send(JSON.stringify({ type: "crowd_map_voted", eventCode, serverTime: Date.now() }));
+  crowdMapBroadcastStatus(eventCode);
+}
+
+// Belirli bir bölgeye (A-Sol / A-Sağ / B-Sol / B-Sağ) rengi gönderir.
+function broadcastToQuadrant(code, quadrant, msg) {
+  const eventCode = normalizeCode(code);
+  const room = rooms.get(eventCode);
+  if (!room) return 0;
+  let sent = 0;
+  for (const client of room) {
+    if (client.role === "phone" && client.readyState === WebSocket.OPEN && client.crowdQuadrant === quadrant) {
+      try { client.send(JSON.stringify(msg)); sent++; } catch (e) {}
+    }
+  }
+  return sent;
+}
+/* ---------------- /SEYİRCİ HARİTALA ---------------- */
+
 wss.on("connection", (ws) => {
   serverStats.totalConnections++;
 
@@ -578,6 +678,11 @@ wss.on("connection", (ws) => {
 
     if (type === "health_request") {
       sendHealth(ws, msg.eventCode || ws.eventCode);
+      return;
+    }
+
+    if (type === "crowd_map_vote") {
+      crowdMapVote(ws, msg.choice === "left" ? "left" : "right");
       return;
     }
 
@@ -775,6 +880,59 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      if (msg.command === "crowd_map_start_round") {
+        const sent = startCrowdMapRound(eventCode, Number(msg.round || 1));
+        ws.send(JSON.stringify({
+          type: "sent", sent, eventCode,
+          commandType: "crowd_map_start_round", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
+      if (msg.command === "crowd_map_quadrant_color") {
+        const color = String(msg.color || "#ffffff");
+        const durationMs = Math.max(300, Number(msg.durationMs || 2000));
+        const sent = broadcastToQuadrant(eventCode, msg.quadrant, {
+          type: "color",
+          id: "crowdmap_" + Date.now(),
+          startAt: Date.now() + 250,
+          color,
+          torchMode: false,
+          calibration: msg.calibration || {}
+        });
+        setTimeout(() => {
+          broadcastToQuadrant(eventCode, msg.quadrant, { type: "stop", startAt: Date.now() });
+        }, 250 + durationMs);
+        ws.send(JSON.stringify({
+          type: "sent", sent, eventCode,
+          commandType: "crowd_map_quadrant_color", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
+      if (msg.command === "crowd_map_wave") {
+        const color = String(msg.color || "#ffffff");
+        const stepMs = Math.max(300, Number(msg.stepMs || 700));
+        const holdMs = Math.max(300, Number(msg.holdMs || 900));
+        const order = ["A-Sol", "A-Sağ", "B-Sağ", "B-Sol"]; // sahne önünden bir tur
+        order.forEach((quadrant, i) => {
+          setTimeout(() => {
+            broadcastToQuadrant(eventCode, quadrant, {
+              type: "color", id: "crowdmapwave_" + Date.now() + "_" + i,
+              startAt: Date.now() + 100, color, torchMode: false, calibration: msg.calibration || {}
+            });
+            setTimeout(() => {
+              broadcastToQuadrant(eventCode, quadrant, { type: "stop", startAt: Date.now() });
+            }, 100 + holdMs);
+          }, i * stepMs);
+        });
+        ws.send(JSON.stringify({
+          type: "sent", sent: 0, eventCode,
+          commandType: "crowd_map_wave", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
       let command;
       if (msg.command === "stop_loop") {
         command = createStopCommand(msg);
@@ -843,6 +1001,11 @@ wss.on("connection", (ws) => {
           if (raffle.phase === "registering") raffleRegBroadcastUpdate(eventCode);
           else raffleBroadcastUpdate(eventCode);
         }
+      }
+
+      // Seyirci haritalamada da kopan telefon anlık sayımlardan düşsün.
+      if (crowdMapState.has(eventCode)) {
+        crowdMapBroadcastStatus(eventCode);
       }
     }
   });
