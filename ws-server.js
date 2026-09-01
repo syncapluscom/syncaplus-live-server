@@ -589,8 +589,7 @@ function startCrowdMapRound(code, round) {
   const room = rooms.get(eventCode);
   if (!room) return 0;
 
-  // Görsel sırayla tutarlı olsun diye: 2. Tur = B (sol), 3. Tur = A (sağ).
-  const targetGroup = round === 2 ? "B" : round === 3 ? "A" : null;
+  const targetGroup = round === 2 ? "A" : round === 3 ? "B" : null;
   crowdMapState.set(eventCode, { round, targetGroup });
 
   let sentTo = 0;
@@ -615,12 +614,12 @@ function crowdMapVote(ws, choice) {
   if (state.round === 1) {
     // Görseldeki yerleşime göre: SOL = B Grubu (mavi), SAĞ = A Grubu (kırmızı).
     ws.crowdGroup1 = choice === "left" ? "B" : "A";
-  } else if (state.round === 2 && ws.crowdGroup1 === "B") {
-    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
-    ws.crowdQuadrant = "B-" + ws.crowdGroup2;
-  } else if (state.round === 3 && ws.crowdGroup1 === "A") {
+  } else if (state.round === 2 && ws.crowdGroup1 === "A") {
     ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
     ws.crowdQuadrant = "A-" + ws.crowdGroup2;
+  } else if (state.round === 3 && ws.crowdGroup1 === "B") {
+    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
+    ws.crowdQuadrant = "B-" + ws.crowdGroup2;
   } else {
     return; // bu turda oy kullanmaya uygun değil
   }
@@ -916,7 +915,7 @@ wss.on("connection", (ws) => {
         const color = String(msg.color || "#ffffff");
         const stepMs = Math.max(300, Number(msg.stepMs || 700));
         const holdMs = Math.max(300, Number(msg.holdMs || 900));
-        const order = ["B-Sol", "B-Sağ", "A-Sağ", "A-Sol"]; // soldan (B) sağa (A) fiziksel bir tur
+        const order = ["A-Sol", "A-Sağ", "B-Sağ", "B-Sol"]; // sahne önünden bir tur
         order.forEach((quadrant, i) => {
           setTimeout(() => {
             broadcastToQuadrant(eventCode, quadrant, {
