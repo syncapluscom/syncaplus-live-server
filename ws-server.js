@@ -612,7 +612,8 @@ function crowdMapVote(ws, choice) {
   if (!state) return;
 
   if (state.round === 1) {
-    ws.crowdGroup1 = choice === "left" ? "A" : "B";
+    // Görseldeki yerleşime göre: SOL = B Grubu (mavi), SAĞ = A Grubu (kırmızı).
+    ws.crowdGroup1 = choice === "left" ? "B" : "A";
   } else if (state.round === 2 && ws.crowdGroup1 === "A") {
     ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
     ws.crowdQuadrant = "A-" + ws.crowdGroup2;
