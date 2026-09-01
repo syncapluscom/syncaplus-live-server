@@ -556,7 +556,7 @@ function crowdMapBroadcastStatus(code) {
   const state = crowdMapState.get(eventCode) || null;
 
   let leftCount = 0, rightCount = 0;
-  let quadCounts = { "A-Sol": 0, "A-Sağ": 0, "B-Sol": 0, "B-Sağ": 0 };
+  let quadCounts = { "B_SOL": 0, "B_SAG": 0, "A_SOL": 0, "A_SAG": 0 };
   for (const client of room) {
     if (client.role !== "phone") continue;
     if (client.crowdQuadrant) quadCounts[client.crowdQuadrant] = (quadCounts[client.crowdQuadrant] || 0) + 1;
@@ -564,7 +564,7 @@ function crowdMapBroadcastStatus(code) {
       if (client.crowdGroup1 === "B") leftCount++; else rightCount++;
     }
     if (state && state.round > 1 && client.crowdGroup1 === state.targetGroup && client.crowdGroup2) {
-      if (client.crowdGroup2 === "Sol") leftCount++; else rightCount++;
+      if (client.crowdGroup2 === "SOL") leftCount++; else rightCount++;
     }
   }
 
@@ -616,11 +616,11 @@ function crowdMapVote(ws, choice) {
     // Görseldeki yerleşime göre: SOL = B Grubu (mavi), SAĞ = A Grubu (kırmızı).
     ws.crowdGroup1 = choice === "left" ? "B" : "A";
   } else if (state.round === 2 && ws.crowdGroup1 === "B") {
-    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
-    ws.crowdQuadrant = "B-" + ws.crowdGroup2;
+    ws.crowdGroup2 = choice === "left" ? "SOL" : "SAG";
+    ws.crowdQuadrant = "B_" + ws.crowdGroup2;
   } else if (state.round === 3 && ws.crowdGroup1 === "A") {
-    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
-    ws.crowdQuadrant = "A-" + ws.crowdGroup2;
+    ws.crowdGroup2 = choice === "left" ? "SOL" : "SAG";
+    ws.crowdQuadrant = "A_" + ws.crowdGroup2;
   } else {
     return; // bu turda oy kullanmaya uygun değil
   }
@@ -646,7 +646,7 @@ function broadcastToQuadrant(code, quadrant, msg) {
 
 /* ---------------- 4 BÖLGELİ ÖRÜNTÜ (B-Sol/B-Sağ/A-Sol/A-Sağ) ---------------- */
 const quadrantPatternState = new Map(); // eventCode -> { timers: [], loop, steps }
-const QUADRANTS = ["B-Sol", "B-Sağ", "A-Sol", "A-Sağ"];
+const QUADRANTS = ["B_SOL", "B_SAG", "A_SOL", "A_SAG"]; // ASCII güvenli iç kimlikler (Türkçe karakter kodlama riskini önler)
 
 function stopQuadrantPattern(code) {
   const eventCode = normalizeCode(code);
@@ -659,7 +659,7 @@ function stopQuadrantPattern(code) {
   QUADRANTS.forEach((q) => broadcastToQuadrant(eventCode, q, { type: "stop", startAt: Date.now() }));
 }
 
-// steps: [{ durationMs, colors: { "B-Sol": "#fff"|null, "B-Sağ": ..., "A-Sol": ..., "A-Sağ": ... } }, ...]
+// steps: [{ durationMs, mode: 'screen'|'torch'|'both', colors: { "B_SOL": "#fff"|null, "B_SAG": ..., "A_SOL": ..., "A_SAG": ... } }, ...]
 function playQuadrantPattern(code, steps, loop) {
   const eventCode = normalizeCode(code);
   stopQuadrantPattern(eventCode);
@@ -673,12 +673,13 @@ function playQuadrantPattern(code, steps, loop) {
 
     const timer = setTimeout(() => {
       if (!quadrantPatternState.has(eventCode)) return; // durdurulmuş
+      const torchMode = step.mode === "torch" || step.mode === "both";
       QUADRANTS.forEach((q) => {
         const color = step.colors && step.colors[q];
         if (color) {
           broadcastToQuadrant(eventCode, q, {
             type: "color", id: "qp_" + Date.now() + "_" + q,
-            startAt: Date.now() + 60, color, torchMode: false, calibration: step.calibration || {}
+            startAt: Date.now() + 60, color, torchMode, calibration: step.calibration || {}
           });
         } else {
           broadcastToQuadrant(eventCode, q, { type: "stop", startAt: Date.now() });
@@ -985,7 +986,7 @@ wss.on("connection", (ws) => {
         const color = String(msg.color || "#ffffff");
         const stepMs = Math.max(300, Number(msg.stepMs || 700));
         const holdMs = Math.max(300, Number(msg.holdMs || 900));
-        const order = ["B-Sol", "B-Sağ", "A-Sağ", "A-Sol"]; // soldan (B) sağa (A) fiziksel bir tur
+        const order = ["B_SOL", "B_SAG", "A_SAG", "A_SOL"]; // soldan (B) sağa (A) fiziksel bir tur
         order.forEach((quadrant, i) => {
           setTimeout(() => {
             broadcastToQuadrant(eventCode, quadrant, {
