@@ -561,7 +561,7 @@ function crowdMapBroadcastStatus(code) {
     if (client.role !== "phone") continue;
     if (client.crowdQuadrant) quadCounts[client.crowdQuadrant] = (quadCounts[client.crowdQuadrant] || 0) + 1;
     if (state && state.round === 1 && client.crowdGroup1) {
-      if (client.crowdGroup1 === "A") leftCount++; else rightCount++;
+      if (client.crowdGroup1 === "B") leftCount++; else rightCount++;
     }
     if (state && state.round > 1 && client.crowdGroup1 === state.targetGroup && client.crowdGroup2) {
       if (client.crowdGroup2 === "Sol") leftCount++; else rightCount++;
@@ -589,7 +589,8 @@ function startCrowdMapRound(code, round) {
   const room = rooms.get(eventCode);
   if (!room) return 0;
 
-  const targetGroup = round === 2 ? "A" : round === 3 ? "B" : null;
+  // Görsel sırayla tutarlı olsun diye: 2. Tur = B (sol), 3. Tur = A (sağ).
+  const targetGroup = round === 2 ? "B" : round === 3 ? "A" : null;
   crowdMapState.set(eventCode, { round, targetGroup });
 
   let sentTo = 0;
@@ -614,12 +615,12 @@ function crowdMapVote(ws, choice) {
   if (state.round === 1) {
     // Görseldeki yerleşime göre: SOL = B Grubu (mavi), SAĞ = A Grubu (kırmızı).
     ws.crowdGroup1 = choice === "left" ? "B" : "A";
-  } else if (state.round === 2 && ws.crowdGroup1 === "A") {
-    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
-    ws.crowdQuadrant = "A-" + ws.crowdGroup2;
-  } else if (state.round === 3 && ws.crowdGroup1 === "B") {
+  } else if (state.round === 2 && ws.crowdGroup1 === "B") {
     ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
     ws.crowdQuadrant = "B-" + ws.crowdGroup2;
+  } else if (state.round === 3 && ws.crowdGroup1 === "A") {
+    ws.crowdGroup2 = choice === "left" ? "Sol" : "Sağ";
+    ws.crowdQuadrant = "A-" + ws.crowdGroup2;
   } else {
     return; // bu turda oy kullanmaya uygun değil
   }
@@ -642,6 +643,75 @@ function broadcastToQuadrant(code, quadrant, msg) {
   return sent;
 }
 /* ---------------- /SEYİRCİ HARİTALA ---------------- */
+
+/* ---------------- 4 BÖLGELİ ÖRÜNTÜ (B-Sol/B-Sağ/A-Sol/A-Sağ) ---------------- */
+const quadrantPatternState = new Map(); // eventCode -> { timers: [], loop, steps }
+const QUADRANTS = ["B-Sol", "B-Sağ", "A-Sol", "A-Sağ"];
+
+function stopQuadrantPattern(code) {
+  const eventCode = normalizeCode(code);
+  const state = quadrantPatternState.get(eventCode);
+  if (state) {
+    state.timers.forEach((t) => clearTimeout(t));
+    quadrantPatternState.delete(eventCode);
+  }
+  // Ekranı temiz bırak
+  QUADRANTS.forEach((q) => broadcastToQuadrant(eventCode, q, { type: "stop", startAt: Date.now() }));
+}
+
+// steps: [{ durationMs, colors: { "B-Sol": "#fff"|null, "B-Sağ": ..., "A-Sol": ..., "A-Sağ": ... } }, ...]
+function playQuadrantPattern(code, steps, loop) {
+  const eventCode = normalizeCode(code);
+  stopQuadrantPattern(eventCode);
+
+  const state = { timers: [], loop: !!loop, steps };
+  quadrantPatternState.set(eventCode, state);
+
+  function scheduleStep(index, baseDelay) {
+    const step = steps[index];
+    if (!step) return baseDelay;
+
+    const timer = setTimeout(() => {
+      if (!quadrantPatternState.has(eventCode)) return; // durdurulmuş
+      QUADRANTS.forEach((q) => {
+        const color = step.colors && step.colors[q];
+        if (color) {
+          broadcastToQuadrant(eventCode, q, {
+            type: "color", id: "qp_" + Date.now() + "_" + q,
+            startAt: Date.now() + 60, color, torchMode: false, calibration: step.calibration || {}
+          });
+        } else {
+          broadcastToQuadrant(eventCode, q, { type: "stop", startAt: Date.now() });
+        }
+      });
+    }, baseDelay);
+    state.timers.push(timer);
+
+    return baseDelay + Math.max(50, Number(step.durationMs || 300));
+  }
+
+  function playOnce(startDelay) {
+    let delay = startDelay;
+    steps.forEach((_, i) => { delay = scheduleStep(i, delay); });
+    return delay;
+  }
+
+  const totalMs = playOnce(0);
+
+  if (loop) {
+    const loopTimer = setInterval(() => {
+      if (!quadrantPatternState.has(eventCode)) { clearInterval(loopTimer); return; }
+      playOnce(0);
+    }, totalMs);
+    state.timers.push(loopTimer);
+
+    // Güvenlik: panel kapanır/unutulursa loop sonsuza kadar çalışmasın —
+    // 15 dakika sonra otomatik durur.
+    const safetyTimer = setTimeout(() => stopQuadrantPattern(eventCode), 15 * 60 * 1000);
+    state.timers.push(safetyTimer);
+  }
+}
+/* ---------------- /4 BÖLGELİ ÖRÜNTÜ ---------------- */
 
 wss.on("connection", (ws) => {
   serverStats.totalConnections++;
@@ -915,7 +985,7 @@ wss.on("connection", (ws) => {
         const color = String(msg.color || "#ffffff");
         const stepMs = Math.max(300, Number(msg.stepMs || 700));
         const holdMs = Math.max(300, Number(msg.holdMs || 900));
-        const order = ["A-Sol", "A-Sağ", "B-Sağ", "B-Sol"]; // sahne önünden bir tur
+        const order = ["B-Sol", "B-Sağ", "A-Sağ", "A-Sol"]; // soldan (B) sağa (A) fiziksel bir tur
         order.forEach((quadrant, i) => {
           setTimeout(() => {
             broadcastToQuadrant(eventCode, quadrant, {
@@ -930,6 +1000,25 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({
           type: "sent", sent: 0, eventCode,
           commandType: "crowd_map_wave", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
+      if (msg.command === "quadrant_pattern_play") {
+        const steps = Array.isArray(msg.steps) ? msg.steps : [];
+        playQuadrantPattern(eventCode, steps, !!msg.loop);
+        ws.send(JSON.stringify({
+          type: "sent", sent: 0, eventCode,
+          commandType: "quadrant_pattern_play", serverTime: Date.now(), broadcastDurationMs: 0
+        }));
+        return;
+      }
+
+      if (msg.command === "quadrant_pattern_stop") {
+        stopQuadrantPattern(eventCode);
+        ws.send(JSON.stringify({
+          type: "sent", sent: 0, eventCode,
+          commandType: "quadrant_pattern_stop", serverTime: Date.now(), broadcastDurationMs: 0
         }));
         return;
       }
