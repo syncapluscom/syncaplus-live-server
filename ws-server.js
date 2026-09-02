@@ -681,15 +681,23 @@ function playQuadrantPattern(code, steps, loop) {
 
     const timer = setTimeout(() => {
       if (!quadrantPatternState.has(eventCode)) return; // durdurulmuş
+
+      // Dört bölgenin aynı fiziksel anda değişmesi için mesajları biraz daha erken
+      // gönderip ortak bir gelecek startAt zamanı veriyoruz. 60 ms OPPO/ColorOS gibi
+      // jitter'lı cihazlarda yetersiz kalabiliyordu; 260 ms Wi-Fi + browser scheduler
+      // farklarını absorbe eder. Telefon istemcisi kendi clock offset'ini ölçerek bu
+      // server zamanını yerel zamana çevirir.
+      const targetAt = Date.now() + 260;
+
       QUADRANTS.forEach((q) => {
         const color = step.colors && step.colors[q];
         if (color) {
           broadcastToQuadrant(eventCode, q, {
             type: "color", id: "qp_" + Date.now() + "_" + q,
-            startAt: Date.now() + 60, color, torchMode, calibration: step.calibration || {}
+            startAt: targetAt, color, torchMode, calibration: step.calibration || {}
           });
         } else {
-          broadcastToQuadrant(eventCode, q, { type: "stop", startAt: Date.now() });
+          broadcastToQuadrant(eventCode, q, { type: "stop", startAt: targetAt });
         }
       });
     }, baseDelay);
