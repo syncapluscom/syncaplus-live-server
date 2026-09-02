@@ -672,12 +672,10 @@ function playQuadrantPattern(code, steps, loop) {
     if (!step) return baseDelay;
 
     const torchMode = step.mode === "torch" || step.mode === "both";
-    // Bazı Android cihazlarda (özellikle OPPO/ColorOS tarafında) kamera torch
-    // constraint'inin fiziksel LED'e yansıması 300 ms civarındaki çok kısa
-    // adımlardan daha geç olabiliyor. Bu durumda sıradaki STOP, LED daha
-    // görünür biçimde yanmadan geliyor. Torch içeren 4-bölge adımlarını
-    // en az 450 ms tutuyoruz; ekran-only adımlar eski hızında kalır.
-    const effectiveDurationMs = Math.max(torchMode ? 450 : 50, Number(step.durationMs || 300));
+    // Örüntünün kayıtlı zaman çizelgesini aynen koru. OPPO/ColorOS gibi yavaş
+    // torch cihazlarında uyumluluk telefon istemcisinde yönetilir; sunucu tüm
+    // cihazları 450 ms'ye zorlayarak iPhone/Samsung hızını düşürmez.
+    const effectiveDurationMs = Math.max(50, Number(step.durationMs || 300));
 
     const timer = setTimeout(() => {
       if (!quadrantPatternState.has(eventCode)) return; // durdurulmuş
