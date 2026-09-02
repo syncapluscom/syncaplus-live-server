@@ -671,9 +671,16 @@ function playQuadrantPattern(code, steps, loop) {
     const step = steps[index];
     if (!step) return baseDelay;
 
+    const torchMode = step.mode === "torch" || step.mode === "both";
+    // Bazı Android cihazlarda (özellikle OPPO/ColorOS tarafında) kamera torch
+    // constraint'inin fiziksel LED'e yansıması 300 ms civarındaki çok kısa
+    // adımlardan daha geç olabiliyor. Bu durumda sıradaki STOP, LED daha
+    // görünür biçimde yanmadan geliyor. Torch içeren 4-bölge adımlarını
+    // en az 450 ms tutuyoruz; ekran-only adımlar eski hızında kalır.
+    const effectiveDurationMs = Math.max(torchMode ? 450 : 50, Number(step.durationMs || 300));
+
     const timer = setTimeout(() => {
       if (!quadrantPatternState.has(eventCode)) return; // durdurulmuş
-      const torchMode = step.mode === "torch" || step.mode === "both";
       QUADRANTS.forEach((q) => {
         const color = step.colors && step.colors[q];
         if (color) {
@@ -688,7 +695,7 @@ function playQuadrantPattern(code, steps, loop) {
     }, baseDelay);
     state.timers.push(timer);
 
-    return baseDelay + Math.max(50, Number(step.durationMs || 300));
+    return baseDelay + effectiveDurationMs;
   }
 
   function playOnce(startDelay) {
